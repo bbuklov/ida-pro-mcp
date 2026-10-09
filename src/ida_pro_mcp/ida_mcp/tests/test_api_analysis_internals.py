@@ -1,13 +1,10 @@
 """Targeted tests for deeper internal helpers in api_analysis.py."""
 
-import json
-
 from ..framework import test, assert_non_empty
 from ..api_analysis import (
-    _DECOMPILE_CODE_MAX_CHARS,
-    _DECOMPILE_RESULT_MAX_CHARS,
     DecompileResult,
     _attach_decompile_refs,
+    _limit_items,
     _paginate_decompile_code,
     _resolve_insn_scan_ranges,
     _scan_insn_ranges,
@@ -129,33 +126,44 @@ def test_internal_immediate_encoding_helpers():
 
 
 @test()
-def test_internal_decompile_pagination_respects_character_budget():
-    """Large line pages stop at the character budget and advance by visible lines."""
-    lines = [f"{i:04d} " + ("x" * 115) for i in range(500)]
-    code = "\n".join(lines)
-
-    page1, count1, total, more1 = _paginate_decompile_code(code, 0, 500)
-    assert 0 < count1 < 500
-    assert total == 500
-    assert more1 is True
-    assert page1.split("\n") == lines[:count1]
-    assert len(json.dumps(page1)) <= _DECOMPILE_CODE_MAX_CHARS
-
-    page2, count2, total2, more2 = _paginate_decompile_code(
-        code, count1, 500
-    )
-    assert count2 > 0
-    assert total2 == total
-    assert page2.split("\n") == lines[count1 : count1 + count2]
-    assert more2 is (count1 + count2 < total)
+def test_internal_explicit_item_limits_report_actual_omissions():
+    """Only explicit positive limits select subsets; exact-length lists are complete."""
+    items = list(range(6_000))
+    assert _limit_items(items, 0) == (items, False)
+    assert _limit_items(items, 6_000) == (items, False)
+    assert _limit_items(items, 6_001) == (items, False)
+    assert _limit_items(items, 5_500) == (items[:5_500], True)
 
 
 @test()
-def test_internal_decompile_refs_fit_result_budget():
-    """First-page refs are truncated before they can trigger RPC truncation."""
+def test_internal_decompile_pagination_preserves_requested_lines():
+    """Large line pages retain every requested line and advance by visible lines."""
+    lines = [f"{i:04d} " + ("x" * 115) for i in range(500)]
+    code = "\n".join(lines)
+
+    full, full_count, full_total, full_more = _paginate_decompile_code(code, 0, 0)
+    assert full == code
+    assert full_count == full_total == 500
+    assert full_more is False
+
+    page1, count1, total, more1 = _paginate_decompile_code(code, 0, 400)
+    assert count1 == 400
+    assert total == 500
+    assert more1 is True
+    assert page1.split("\n") == lines[:count1]
+    page2, count2, total2, more2 = _paginate_decompile_code(code, count1, 400)
+    assert count2 == 100
+    assert total2 == total
+    assert page2.split("\n") == lines[count1 : count1 + count2]
+    assert more2 is False
+
+
+@test()
+def test_internal_decompile_refs_preserve_all_references():
+    """Large first-page references are returned without an implicit size budget."""
     result: DecompileResult = {
         "addr": "main",
-        "code": "x" * _DECOMPILE_CODE_MAX_CHARS,
+        "code": "x" * 30_000,
         "line_count": 1,
         "total_lines": 1,
         "truncated": False,
@@ -168,8 +176,6 @@ def test_internal_decompile_refs_fit_result_budget():
 
     _attach_decompile_refs(result, refs)
 
-    retained = result.get("refs", [])
-    assert retained
-    assert len(retained) < len(refs)
-    assert result.get("refs_truncated") is True
-    assert len(json.dumps(result)) <= _DECOMPILE_RESULT_MAX_CHARS
+    assert result["refs"] == refs
+    assert not result.get("refs_truncated", False)
+    assert result["code"] == "x" * 30_000

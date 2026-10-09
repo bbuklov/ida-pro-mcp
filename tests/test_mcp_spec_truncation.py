@@ -1,9 +1,4 @@
-"""Truncation middleware invariants. Regression guards for #361 and e802b32.
-
-Truncated structuredContent must still validate against the tool's
-outputSchema, and truncation metadata must live under `_meta`, not
-merged into structuredContent.
-"""
+"""Complete-output MCP envelope and schema regressions for this fork."""
 
 import importlib
 import json
@@ -37,25 +32,16 @@ class _ListResult(TypedDict):
     count: int
 
 
-def _fresh_truncated_server() -> McpServer:
-    """McpServer with the production truncation middleware (rpc.py) applied."""
-    rpc = load_ida_rpc_module()
-    srv = rpc.McpServer("truncation-test")
-    original = srv.registry.methods["tools/call"]
-
-    def patched(name, arguments=None, _meta=None):
-        response = original(name, arguments, _meta)
-        return rpc._limit_output_response(response)
-
-    srv.registry.methods["tools/call"] = patched
-    return srv
+def _fresh_full_output_server() -> McpServer:
+    """Use the production RPC module's server without extra middleware."""
+    return load_ida_rpc_module().MCP_SERVER
 
 
-class TruncationInvariantTests(unittest.TestCase):
+class FullOutputInvariantTests(unittest.TestCase):
     def _call_large_list_tool(self, srv):
         @srv.tool
         def big_list() -> _ListResult:
-            """Returns a huge list; forces truncation."""
+            """Return a list larger than the former response preview."""
             return {
                 "items": [{"name": f"n{i}", "value": i} for i in range(5000)],
                 "count": 5000,
@@ -66,47 +52,48 @@ class TruncationInvariantTests(unittest.TestCase):
         result = call_rpc(srv, "tools/call", name="big_list", arguments={})
         return tool, result
 
-    def test_truncation_actually_triggers_on_large_output(self):
-        srv = _fresh_truncated_server()
+    def test_large_output_is_complete(self):
+        srv = _fresh_full_output_server()
         _, result = self._call_large_list_tool(srv)
-        self.assertIn("_meta", result)
-        self.assertIn("ida_mcp", result["_meta"])
+        data = result["structuredContent"]
+        self.assertEqual(len(data["items"]), data["count"])
+        self.assertEqual(data["items"][-1], {"name": "n4999", "value": 4999})
+        self.assertEqual(json.loads(result["content"][0]["text"]), data)
+        self.assertNotIn("_meta", result)
 
-    def test_truncated_structuredContent_matches_outputSchema(self):
-        srv = _fresh_truncated_server()
+    def test_full_structuredContent_matches_outputSchema(self):
+        srv = _fresh_full_output_server()
         tool, result = self._call_large_list_tool(srv)
         Draft202012Validator(tool["outputSchema"]).validate(result["structuredContent"])
 
-    def test_truncated_response_envelope_is_valid_call_tool_result(self):
-        srv = _fresh_truncated_server()
+    def test_full_response_envelope_is_valid_call_tool_result(self):
+        srv = _fresh_full_output_server()
         _, result = self._call_large_list_tool(srv)
         assert_schema(result, CALL_TOOL_RESULT_SCHEMA)
 
-    def test_truncation_metadata_not_inside_structuredContent(self):
+    def test_response_fields_remain_schema_valid(self):
         # Regression for #361: underscore-prefixed fields must not leak.
-        srv = _fresh_truncated_server()
+        srv = _fresh_full_output_server()
         _, result = self._call_large_list_tool(srv)
         leaked = [k for k in result["structuredContent"] if k.startswith("_")]
         self.assertFalse(leaked, f"leaked keys: {leaked}")
 
-    def test_truncated_items_do_not_contain_sentinel_dict(self):
+    def test_full_items_do_not_contain_sentinel_dict(self):
         # Regression for e802b32: no {"_truncated": ...} appended to lists.
-        srv = _fresh_truncated_server()
+        srv = _fresh_full_output_server()
         _, result = self._call_large_list_tool(srv)
         for item in result["structuredContent"].get("items", []):
             with self.subTest(item=item):
                 self.assertEqual(set(item.keys()), {"name", "value"})
 
-    def test_download_url_is_valid_looking_url(self):
-        srv = _fresh_truncated_server()
+    def test_large_output_needs_no_download_hint(self):
+        srv = _fresh_full_output_server()
         _, result = self._call_large_list_tool(srv)
-        meta = result["_meta"]["ida_mcp"]
-        self.assertTrue(meta["output_truncated"])
-        self.assertTrue(meta["download_url"].startswith("http://"))
-        self.assertIn("/output/", meta["download_url"])
+        self.assertNotIn("ida_mcp", result.get("_meta", {}))
+        self.assertEqual(len(result["content"]), 1)
 
     def test_content_text_blocks_are_valid(self):
-        srv = _fresh_truncated_server()
+        srv = _fresh_full_output_server()
         _, result = self._call_large_list_tool(srv)
         self.assertGreaterEqual(len(result["content"]), 1)
         for block in result["content"]:
@@ -114,11 +101,11 @@ class TruncationInvariantTests(unittest.TestCase):
                 self.assertEqual(block["type"], "text")
                 self.assertIsInstance(block["text"], str)
 
-    def test_preview_respects_aggregate_character_budget(self):
+    def test_many_large_fields_are_preserved(self):
         class ManyStrings(TypedDict):
             fields: dict[str, str]
 
-        srv = _fresh_truncated_server()
+        srv = _fresh_full_output_server()
 
         @srv.tool
         def many_strings() -> ManyStrings:
@@ -126,20 +113,18 @@ class TruncationInvariantTests(unittest.TestCase):
             return {"fields": {f"field_{i}": "x" * 10000 for i in range(20)}}
 
         result = call_rpc(srv, "tools/call", name="many_strings", arguments={})
-        preview = result["structuredContent"]
-        rpc = load_ida_rpc_module()
-        self.assertLessEqual(
-            len(json.dumps(preview)), rpc.OUTPUT_LIMIT_PREVIEW_MAX_CHARS
-        )
+        data = result["structuredContent"]
+        self.assertEqual(len(data["fields"]), 20)
+        self.assertTrue(all(value == "x" * 10000 for value in data["fields"].values()))
 
 
-class DownloadUrlDerivationOverHttpTests(unittest.TestCase):
-    def test_download_url_uses_forwarded_public_base(self):
-        srv = _fresh_truncated_server()
+class FullOutputOverHttpTests(unittest.TestCase):
+    def test_forwarded_public_base_does_not_change_complete_output(self):
+        srv = _fresh_full_output_server()
 
         @srv.tool
         def big_list() -> _ListResult:
-            """Returns a huge list; forces truncation."""
+            """Return a list larger than the former response preview."""
             return {
                 "items": [{"name": f"n{i}", "value": i} for i in range(5000)],
                 "count": 5000,
@@ -155,15 +140,15 @@ class DownloadUrlDerivationOverHttpTests(unittest.TestCase):
             )
 
         self.assertEqual(status, 200)
-        meta = response["result"]["_meta"]["ida_mcp"]
-        self.assertTrue(meta["download_url"].startswith("https://mcp.example.com/output/"))
+        self.assertEqual(len(response["result"]["structuredContent"]["items"]), 5000)
+        self.assertNotIn("_meta", response["result"])
 
-    def test_download_url_uses_forwarded_prefix(self):
-        srv = _fresh_truncated_server()
+    def test_forwarded_prefix_does_not_change_complete_output(self):
+        srv = _fresh_full_output_server()
 
         @srv.tool
         def big_list() -> _ListResult:
-            """Returns a huge list; forces truncation."""
+            """Return a list larger than the former response preview."""
             return {
                 "items": [{"name": f"n{i}", "value": i} for i in range(5000)],
                 "count": 5000,
@@ -181,17 +166,13 @@ class DownloadUrlDerivationOverHttpTests(unittest.TestCase):
             )
 
         self.assertEqual(status, 200)
-        meta = response["result"]["_meta"]["ida_mcp"]
-        self.assertTrue(
-            meta["download_url"].startswith(
-                "https://mcp.example.com/ida/proxy/output/"
-            )
-        )
+        self.assertEqual(len(response["result"]["structuredContent"]["items"]), 5000)
+        self.assertNotIn("_meta", response["result"])
 
 
 class NonTruncatedOutputsUnchangedTests(unittest.TestCase):
     def test_small_output_has_no_truncation_metadata(self):
-        srv = _fresh_truncated_server()
+        srv = _fresh_full_output_server()
 
         @srv.tool
         def small() -> _ListResult:
@@ -202,7 +183,7 @@ class NonTruncatedOutputsUnchangedTests(unittest.TestCase):
         self.assertNotIn("ida_mcp", result.get("_meta") or {})
 
     def test_small_output_structuredContent_is_exact(self):
-        srv = _fresh_truncated_server()
+        srv = _fresh_full_output_server()
 
         @srv.tool
         def small() -> _ListResult:
@@ -216,7 +197,7 @@ class NonTruncatedOutputsUnchangedTests(unittest.TestCase):
         )
 
 
-class TruncationOverDeeplyNestedDataTests(unittest.TestCase):
+class CompleteDeeplyNestedDataTests(unittest.TestCase):
     def test_nested_dict_output_still_schema_valid(self):
         class Deep(TypedDict):
             label: str
@@ -225,7 +206,7 @@ class TruncationOverDeeplyNestedDataTests(unittest.TestCase):
         class Outer(TypedDict):
             levels: dict[str, Deep]
 
-        srv = _fresh_truncated_server()
+        srv = _fresh_full_output_server()
 
         @srv.tool
         def deep() -> Outer:
@@ -272,26 +253,21 @@ class DownloadBaseUrlFromEnvTests(unittest.TestCase):
             "https://mcp.example.com/ida",
         )
 
-    def test_truncated_output_still_advertises_an_absolute_download_url(self):
+    def test_complete_output_does_not_need_a_download_url(self):
         self._reload_rpc_with_url("")
-        srv = _fresh_truncated_server()
+        srv = _fresh_full_output_server()
 
         @srv.tool
         def big_list() -> _ListResult:
-            """Returns a huge list; forces truncation."""
+            """Return a list larger than the former response preview."""
             return {
                 "items": [{"name": f"n{i}", "value": i} for i in range(5000)],
                 "count": 5000,
             }
 
         result = call_rpc(srv, "tools/call", name="big_list", arguments={})
-        meta = result["_meta"]["ida_mcp"]
-        self.assertTrue(meta["output_truncated"])
-        self.assertTrue(
-            meta["download_url"].startswith("http://127.0.0.1:13337/output/"),
-            meta["download_url"],
-        )
-        self.assertIn(meta["download_url"], meta["download_hint"])
+        self.assertNotIn("_meta", result)
+        self.assertEqual(len(result["structuredContent"]["items"]), 5000)
 
 
 if __name__ == "__main__":
