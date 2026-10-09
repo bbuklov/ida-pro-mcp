@@ -23,13 +23,6 @@ from .utils import (
     normalize_list_input,
 )
 
-# Max decompile lines before truncation.
-_DECOMPILE_LINE_CAP = 100
-# Max strings/constants returned in compact mode.
-_TOP_STRINGS = 10
-_TOP_CONSTANTS = 10
-# Constants filtered out of extract_function_constants results.
-_BORING_CONSTANTS = frozenset({0, 1, -1, 0xFF, 0xFFFF, 0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF})
 
 
 class BasicBlockSummary(TypedDict):
@@ -163,43 +156,26 @@ def _basic_block_info(ea: int) -> BasicBlockSummary:
     return {"count": nodes, "cyclomatic_complexity": edges - nodes + 2}
 
 
-def _filter_constants(raw: list[dict], limit: int = _TOP_CONSTANTS) -> list[dict]:
-    """Drop boring constants, return top N by absolute value."""
-    out = []
-    for c in raw:
-        val = c.get("value", 0)
-        if not isinstance(val, int):
-            continue
-        if abs(val) < 0x100 or val in _BORING_CONSTANTS:
-            continue
-        out.append(c)
-    out.sort(key=lambda c: abs(c.get("value", 0)) if isinstance(c.get("value"), int) else 0, reverse=True)
-    return out[:limit]
+def _filter_constants(raw: list[dict], limit: int = 0) -> list[dict]:
+    """Return all constants by default; a positive limit selects a prefix."""
+    return raw[:limit] if limit > 0 else list(raw)
 
 
 def _cap_decompile(code: str | None) -> tuple[str | None, int | None]:
-    """Cap decompiled output at _DECOMPILE_LINE_CAP lines.
-    Returns (possibly_truncated_code, total_lines_or_None)."""
-    if code is None:
-        return None, None
-    lines = code.split("\n")
-    total = len(lines)
-    if total <= _DECOMPILE_LINE_CAP:
-        return code, None  # not truncated
-    truncated = "\n".join(lines[:_DECOMPILE_LINE_CAP])
-    return truncated, total
+    """Return complete pseudocode; no implicit line cap applies."""
+    return code, None
 
 
-def _compact_strings(raw: list[dict], limit: int = _TOP_STRINGS) -> list[str]:
-    """Return just the string values, deduplicated, capped at limit."""
+def _compact_strings(raw: list[dict], limit: int = 0) -> list[str]:
+    """Return all distinct string values; a positive limit selects a prefix."""
     seen: set[str] = set()
     out: list[str] = []
-    for s in raw:
-        val = s.get("value") or s.get("string", "")
-        if val and val not in seen:
-            seen.add(val)
-            out.append(val)
-            if len(out) >= limit:
+    for item in raw:
+        value = item.get("value") or item.get("string", "")
+        if value and value not in seen:
+            seen.add(value)
+            out.append(value)
+            if limit > 0 and len(out) >= limit:
                 break
     return out
 
@@ -214,8 +190,7 @@ def _analyze_function_internal(
 ) -> AnalyzeFunctionResult:
     """Core analysis logic — must be called from an @idasync context.
 
-    Returns a compact response by default: decompilation capped at 100 lines,
-    top 10 strings as values only, top 10 non-trivial constants, no disassembly.
+    Returns complete pseudocode, all strings and constants, and no disassembly.
     Pass include_asm=True to include full disassembly."""
     import idaapi
 
@@ -231,7 +206,7 @@ def _analyze_function_internal(
         result["prototype"] = get_prototype(func)
         result["size"] = func.end_ea - func.start_ea
 
-        # Decompilation — capped at _DECOMPILE_LINE_CAP lines.
+        # Complete decompilation.
         raw_code, decompile_err = decompile_function_safe(ea)
         if raw_code is None:
             result["decompiled"] = None
@@ -250,9 +225,9 @@ def _analyze_function_internal(
             except Exception:
                 result["assembly"] = None
 
-        # Strings — top 10 values only.
+        # All distinct string values.
         result["strings"] = _compact_strings(extract_function_strings(ea))
-        # Constants — top 10 non-trivial.
+        # All constants, including small values.
         result["constants"] = _filter_constants(extract_function_constants(ea))
         # Callees/callers — names only.
         result["callees"] = _compact_callees(get_callees(hex(ea)))
@@ -279,7 +254,7 @@ def analyze_function(
     addr: Annotated[str, "Function address or name"],
     include_asm: Annotated[bool, "Include full disassembly (default: false, saves tokens)"] = False,
 ) -> AnalyzeFunctionResult:
-    """Compact single-function analysis: pseudocode, strings, constants, callers, callees, xrefs, blocks."""
+    """Complete single-function analysis: pseudocode, strings, constants, callers, callees, xrefs, blocks."""
 
     try:
         ea = _resolve_addr(addr)
@@ -327,7 +302,7 @@ def analyze_component(
             continue
         name = idaapi.get_func_name(ea) or ""
         strings_raw = extract_function_strings(ea)
-        top_strings = _compact_strings(strings_raw, limit=5)
+        top_strings = _compact_strings(strings_raw)
         callee_list = _compact_callees(get_callees(hex(ea)))
         bb = _basic_block_info(ea)
         functions.append({
@@ -545,8 +520,6 @@ def diff_before_after(
 # Tool 4 — trace_data_flow
 # ---------------------------------------------------------------------------
 
-_MAX_TRACE_NODES = 200
-_MAX_TRACE_EDGES = 500
 
 
 
@@ -595,7 +568,7 @@ def trace_data_flow(
     queue.append((start_ea, 0))
     visited.add(start_ea)
 
-    while queue and len(nodes) < _MAX_TRACE_NODES:
+    while queue:
         ea, depth = queue.popleft()
         if depth > max_depth:
             continue
@@ -632,8 +605,6 @@ def trace_data_flow(
             xrefs = list(idautils.XrefsTo(ea, 0))
 
         for xref in xrefs:
-            if len(edges) >= _MAX_TRACE_EDGES:
-                break
             target = xref.to if direction == "forward" else xref.frm
             # Classify xref type.
             xtype = "code" if xref.iscode else "data"
@@ -644,7 +615,7 @@ def trace_data_flow(
                 "type": xtype,
             })
 
-            if target not in visited and len(nodes) + len(queue) < _MAX_TRACE_NODES:
+            if target not in visited:
                 visited.add(target)
                 queue.append((target, depth + 1))
 

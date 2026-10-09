@@ -1,5 +1,14 @@
 # IDA Pro MCP
 
+## This fork
+
+This fork keeps the complete MCP response on the wire. Function analysis returns
+complete pseudocode, and `decompile` / `disasm` return the full remaining body by
+default (`0` means all). Explicit positive page sizes and offsets remain available
+with accurate cursors. Selected code pages and reference lists have no implicit
+character budget; function-analysis metadata is complete by default. These are
+source changes based on upstream commit `c133c3853faa111a9b00ee615c013b720d0c4acd`.
+
 > [!IMPORTANT]
 > **I recommend using the [Official Hex-Rays IDA MCP Server](https://github.com/HexRaysSA/ida-mcp) instead!**
 > 

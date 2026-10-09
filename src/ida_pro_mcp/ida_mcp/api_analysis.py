@@ -1,4 +1,3 @@
-import json
 import struct
 from itertools import islice
 from typing import Annotated, Any, NotRequired, Optional, TypedDict
@@ -15,7 +14,7 @@ import ida_kernwin
 import ida_xref
 import ida_ua
 import ida_name
-from .rpc import OUTPUT_LIMIT_MAX_CHARS, tool
+from .rpc import tool
 from .sync import idasync, tool_timeout, IDAError
 from .utils import (
     parse_address,
@@ -639,18 +638,25 @@ def _collect_line_refs(ea: int) -> list[Ref]:
 
 
 def _limit_items(items: list, limit: int) -> tuple[list, bool]:
-    if limit < 0:
-        limit = 0
-    if len(items) <= limit:
+    """Select an explicit item limit; zero or a negative value means all."""
+    if limit <= 0 or len(items) <= limit:
         return items, False
     return items[:limit], True
+
+
+def _read_limit(value: object) -> int:
+    """Normalize a requested read limit without imposing a hidden upper bound."""
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
 def _disasm_lines_limited(func: ida_funcs.func_t, max_insns: int) -> tuple[list[str], bool]:
     lines: list[str] = []
     truncated = False
     for item_ea in idautils.FuncItems(func.start_ea):
-        if len(lines) >= max_insns:
+        if max_insns > 0 and len(lines) >= max_insns:
             truncated = True
             break
         line = ida_lines.generate_disasm_line(item_ea, 0)
@@ -665,7 +671,7 @@ def _collect_basic_blocks_limited(
     blocks: list[BasicBlock] = []
     truncated = False
     for block in idaapi.FlowChart(func):
-        if len(blocks) >= max_blocks:
+        if max_blocks > 0 and len(blocks) >= max_blocks:
             truncated = True
             break
         blocks.append(
@@ -782,57 +788,24 @@ def _profile_function(
 # Code Analysis & Decompilation
 # ============================================================================
 
-_DECOMPILE_CODE_MAX_CHARS = 30_000
-_DECOMPILE_RESULT_MAX_CHARS = OUTPUT_LIMIT_MAX_CHARS - 5_000
-
-
 def _paginate_decompile_code(
     code: str, offset: int, max_lines: int
 ) -> tuple[str, int, int, bool]:
-    """Return a line page whose JSON-encoded code fits the output budget."""
+    """Select the requested line page without an implicit character budget."""
     lines = code.split("\n")
     total_lines = len(lines)
-    available = lines[offset : offset + max_lines]
-    page: list[str] = []
-    # json.dumps("") is two quote characters. Embedded newlines encode as "\\n".
-    encoded_chars = 2
-
-    for line in available:
-        addition = len(json.dumps(line)) - 2
-        if page:
-            addition += 2
-        if page and encoded_chars + addition > _DECOMPILE_CODE_MAX_CHARS:
-            break
-        page.append(line)
-        encoded_chars += addition
-
+    end = offset + max_lines if max_lines > 0 else None
+    page = lines[offset:end]
     line_count = len(page)
     more = offset + line_count < total_lines
     return "\n".join(page), line_count, total_lines, more
 
 
 def _attach_decompile_refs(result: DecompileResult, refs: list[Ref]) -> None:
-    """Attach as many refs as fit without pushing the result into RPC truncation."""
-    if not refs:
-        return
-
-    candidate = dict(result)
-    candidate["refs"] = []
-    # Reserve the marker before sizing so adding it cannot cross the budget.
-    candidate["refs_truncated"] = True
-    encoded_chars = len(json.dumps(candidate))
-    retained: list[Ref] = []
-
-    for ref in refs:
-        addition = len(json.dumps(ref)) + (2 if retained else 0)
-        if encoded_chars + addition > _DECOMPILE_RESULT_MAX_CHARS:
-            result["refs_truncated"] = True
-            break
-        retained.append(ref)
-        encoded_chars += addition
-
-    if retained:
-        result["refs"] = retained
+    """Attach all references without a size budget."""
+    result.pop("refs_truncated", None)
+    if refs:
+        result["refs"] = refs
 
 
 @tool
@@ -845,14 +818,12 @@ def decompile(
     ] = True,
     max_lines: Annotated[
         int,
-        "Max pseudocode lines per page (default: 500, max: 5000); "
-        "pages may be smaller to stay under the output cap",
-    ] = 500,
+        "Pseudocode lines to return; 0 (default) returns the complete remaining body",
+    ] = 0,
     offset: Annotated[int, "Skip first N pseudocode lines (default: 0)"] = 0,
 ) -> DecompileResult:
-    """Decompile a function. Follow cursor.next for more code; refs appear on the first page."""
-    if max_lines <= 0 or max_lines > 5000:
-        max_lines = 5000
+    """Read a full function by default. Explicit line pages have a cursor; refs appear on the first page."""
+    max_lines = _read_limit(max_lines)
     if offset < 0:
         offset = 0
 
@@ -880,7 +851,7 @@ def decompile(
             "cursor": {"next": offset + line_count} if more else {"done": True},
         }
 
-        # Refs only on the first page to keep later pages under the RPC size envelope.
+        # References describe the entire function and accompany its first page.
         if offset == 0:
             try:
                 import ida_hexrays
@@ -908,18 +879,16 @@ def decompile(
 def disasm(
     addr: Annotated[str, "Function address or name to disassemble"],
     max_instructions: Annotated[
-        int, "Max instructions per function (default: 5000, max: 50000)"
-    ] = 5000,
+        int,
+        "Instructions to return; 0 (default) returns the complete remaining body",
+    ] = 0,
     offset: Annotated[int, "Skip first N instructions (default: 0)"] = 0,
     include_total: Annotated[
         bool, "Compute total instruction count (default: false)"
     ] = False,
 ) -> DisasmResult:
-    """Disassemble function with offset/max_instructions pagination and optional total count."""
-
-    # Enforce max limit
-    if max_instructions <= 0 or max_instructions > 50000:
-        max_instructions = 50000
+    """Read full assembly by default, or an explicit instruction page with a cursor."""
+    max_instructions = _read_limit(max_instructions)
     if offset < 0:
         offset = 0
 
@@ -960,7 +929,7 @@ def disasm(
             if seen < offset:
                 seen += 1
                 return True
-            if len(lines) < max_instructions:
+            if max_instructions == 0 or len(lines) < max_instructions:
                 line = ida_lines.generate_disasm_line(ea, 0)
                 instruction = ida_lines.tag_remove(line) if line else ""
                 entry: dict = {
@@ -1004,9 +973,6 @@ def disasm(
                 if ea == idaapi.BADADDR:
                     break
 
-        if include_total and not more:
-            more = total_count > offset + max_instructions
-
         rettype = None
         args: Optional[list[Argument]] = None
         stack_frame = None
@@ -1041,7 +1007,7 @@ def disasm(
             "asm": out,
             "instruction_count": len(lines),
             "total_instructions": total_count if include_total else None,
-            "cursor": ({"next": offset + max_instructions} if more else {"done": True}),
+            "cursor": ({"next": offset + len(lines)} if more else {"done": True}),
         }
     except Exception as e:
         return {
@@ -1078,7 +1044,7 @@ def func_profile(
         sort_by = str(query.get("sort_by", "addr") or "addr")
         descending = bool(query.get("descending", False))
         include_lists = bool(query.get("include_lists", False))
-        max_items = _clamp_int(query.get("max_items", 25), 25, 0, 1000)
+        max_items = _read_limit(query.get("max_items", 0))
         include_prototype = bool(query.get("include_prototype", False))
 
         # Resolve candidate function starts.
@@ -1167,7 +1133,7 @@ def analyze_batch(
         "Comprehensive per-function analysis with selectable sections",
     ],
 ) -> list[AnalyzeBatchResult]:
-    """Run comprehensive analysis over one or more target functions."""
+    """Analyze functions with complete selected sections by default; positive max_* values select explicit limits."""
     queries = normalize_dict_list(queries)
 
     results: list[dict] = []
@@ -1216,16 +1182,12 @@ def analyze_batch(
             include_basic_blocks = bool(query.get("include_basic_blocks", True))
             include_proto = bool(query.get("include_proto", True))
 
-            max_disasm_insns = _clamp_int(
-                query.get("max_disasm_insns", 300), 300, 0, 50_000
-            )
-            max_callers = _clamp_int(query.get("max_callers", 100), 100, 0, 5000)
-            max_callees = _clamp_int(query.get("max_callees", 100), 100, 0, 5000)
-            max_strings = _clamp_int(query.get("max_strings", 100), 100, 0, 5000)
-            max_constants = _clamp_int(
-                query.get("max_constants", 200), 200, 0, 10000
-            )
-            max_blocks = _clamp_int(query.get("max_blocks", 500), 500, 0, 10000)
+            max_disasm_insns = _read_limit(query.get("max_disasm_insns", 0))
+            max_callers = _read_limit(query.get("max_callers", 0))
+            max_callees = _read_limit(query.get("max_callees", 0))
+            max_strings = _read_limit(query.get("max_strings", 0))
+            max_constants = _read_limit(query.get("max_constants", 0))
+            max_blocks = _read_limit(query.get("max_blocks", 0))
 
             analysis: dict = {
                 "size": hex(size_int),
@@ -1272,13 +1234,11 @@ def analyze_batch(
                 xrefs = get_all_xrefs(fn.start_ea)
                 xrefs_to = list(xrefs.get("to", []))
                 xrefs_from = list(xrefs.get("from", []))
-                xrefs_to, xto_trunc = _limit_items(xrefs_to, 200)
-                xrefs_from, xfrom_trunc = _limit_items(xrefs_from, 200)
                 analysis["xrefs"] = {
                     "to": xrefs_to,
                     "from": xrefs_from,
-                    "to_truncated": xto_trunc,
-                    "from_truncated": xfrom_trunc,
+                    "to_truncated": False,
+                    "from_truncated": False,
                     "to_count": len(xrefs.get("to", [])),
                     "from_count": len(xrefs.get("from", [])),
                 }
@@ -1286,12 +1246,11 @@ def analyze_batch(
                     analysis["xrefs"]["message"] = "No cross-references to this address"
 
             if include_callers:
-                callers = get_callers(hex(fn.start_ea), limit=max_callers)
-                analysis["caller_count"] = len(callers)
+                all_callers = get_callers(hex(fn.start_ea))
+                callers, callers_truncated = _limit_items(all_callers, max_callers)
+                analysis["caller_count"] = len(all_callers)
                 analysis["callers"] = callers
-                analysis["callers_truncated"] = (
-                    max_callers > 0 and len(callers) >= max_callers
-                )
+                analysis["callers_truncated"] = callers_truncated
 
             if include_callees:
                 all_callees = get_callees(hex(fn.start_ea))
@@ -1317,8 +1276,9 @@ def analyze_batch(
                 analysis["constants_truncated"] = constants_truncated
 
             if include_basic_blocks:
-                blocks, blocks_truncated = _collect_basic_blocks_limited(fn, max_blocks)
-                analysis["basic_block_count"] = len(blocks)
+                all_blocks, _ = _collect_basic_blocks_limited(fn, 0)
+                blocks, blocks_truncated = _limit_items(all_blocks, max_blocks)
+                analysis["basic_block_count"] = len(all_blocks)
                 analysis["basic_blocks"] = blocks
                 analysis["basic_blocks_truncated"] = blocks_truncated
 

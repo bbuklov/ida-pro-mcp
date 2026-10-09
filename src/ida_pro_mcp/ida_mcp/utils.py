@@ -230,7 +230,7 @@ class FuncProfileQuery(TypedDict, total=False):
     sort_by: Annotated[str, "Sort: addr|name|size"]
     descending: Annotated[bool, "Descending"]
     include_lists: Annotated[bool, "Include callers/callees/strings/constants"]
-    max_items: Annotated[int, "Max items per list"]
+    max_items: Annotated[int, "Max items per list (0/default=all)"]
     include_prototype: Annotated[bool, "Include prototype"]
 
 
@@ -247,12 +247,12 @@ class AnalyzeBatchQuery(TypedDict):
     include_constants: NotRequired[Annotated[bool, "Include constants"]]
     include_basic_blocks: NotRequired[Annotated[bool, "Include basic blocks"]]
     include_proto: NotRequired[Annotated[bool, "Include prototype"]]
-    max_disasm_insns: NotRequired[Annotated[int, "Max disasm instructions"]]
-    max_callers: NotRequired[Annotated[int, "Max callers"]]
-    max_callees: NotRequired[Annotated[int, "Max callees"]]
-    max_strings: NotRequired[Annotated[int, "Max strings"]]
-    max_constants: NotRequired[Annotated[int, "Max constants"]]
-    max_blocks: NotRequired[Annotated[int, "Max blocks"]]
+    max_disasm_insns: NotRequired[Annotated[int, "Max disasm instructions (0/default=all)"]]
+    max_callers: NotRequired[Annotated[int, "Max callers (0/default=all)"]]
+    max_callees: NotRequired[Annotated[int, "Max callees (0/default=all)"]]
+    max_strings: NotRequired[Annotated[int, "Max strings (0/default=all)"]]
+    max_constants: NotRequired[Annotated[int, "Max constants (0/default=all)"]]
+    max_blocks: NotRequired[Annotated[int, "Max blocks (0/default=all)"]]
 
 
 class ImportQuery(TypedDict, total=False):
@@ -1277,15 +1277,12 @@ def get_callees(addr: str) -> list[dict]:
         return []
 
 
-def get_callers(addr: str, limit: int = 50) -> list[Function]:
-    """Get callers for a single function address"""
+def get_callers(addr: str, limit: int = 0) -> list[Function]:
+    """Get all callers by default, or an explicitly limited number of callers."""
     try:
         callers = {}
-        iterations = 0
-        max_iterations = limit * 100
         for caller_addr in idautils.CodeRefsTo(parse_address(addr), 0):
-            iterations += 1
-            if len(callers) >= limit or iterations >= max_iterations:
+            if limit > 0 and len(callers) >= limit:
                 break
             func = get_function(caller_addr, raise_error=False)
             if not func:
